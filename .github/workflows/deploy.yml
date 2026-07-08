@@ -1,0 +1,109 @@
+name: Deploy Tienda Perritos a EKS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:   # permite tambien lanzarlo manualmente desde la pestaña Actions
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: mi-tienda-eks-v130
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repo
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login en Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Obtener Account ID y armar ECR_URL
+        id: vars
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "ecr_url=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+      - name: Crear repos ECR si no existen
+        run: |
+          for repo in tienda-frontend tienda-backend tienda-db; do
+            aws ecr describe-repositories --repository-names "$repo" --region ${{ env.AWS_REGION }} \
+              || aws ecr create-repository --repository-name "$repo" --region ${{ env.AWS_REGION }}
+          done
+
+      - name: Build y push - Frontend
+        run: |
+          docker build -t tienda-frontend ./frontend
+          docker tag tienda-frontend:latest ${{ steps.vars.outputs.ecr_url }}/tienda-frontend:eks-v1
+          docker push ${{ steps.vars.outputs.ecr_url }}/tienda-frontend:eks-v1
+
+      - name: Build y push - Backend
+        run: |
+          docker build -t tienda-backend ./backend
+          docker tag tienda-backend:latest ${{ steps.vars.outputs.ecr_url }}/tienda-backend:eks-v1
+          docker push ${{ steps.vars.outputs.ecr_url }}/tienda-backend:eks-v1
+
+      - name: Build y push - DB
+        run: |
+          docker build -t tienda-db ./db
+          docker tag tienda-db:latest ${{ steps.vars.outputs.ecr_url }}/tienda-db:eks-v1
+          docker push ${{ steps.vars.outputs.ecr_url }}/tienda-db:eks-v1
+
+      - name: Reemplazar {{ECR_URL}} en los manifiestos
+        run: |
+          find ./k8s -type f -name "*.yaml" \
+            -exec sed -i "s|{{ECR_URL}}|${{ steps.vars.outputs.ecr_url }}|g" {} \;
+
+      - name: Configurar kubeconfig
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
+
+      - name: Instalar Metrics Server
+        run: |
+          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+      - name: Desplegar Namespace
+        run: kubectl apply -f ./k8s/namespace.yaml
+
+      - name: Desplegar MySQL
+        run: |
+          kubectl apply -f ./k8s/mysql-secret.yaml
+          kubectl apply -f ./k8s/mysql-deployment.yaml
+          kubectl apply -f ./k8s/mysql-service.yaml
+          kubectl rollout status deployment/tienda-db -n tienda --timeout=300s
+
+      - name: Desplegar Backend
+        run: |
+          kubectl apply -f ./k8s/backend-deployment.yaml
+          kubectl apply -f ./k8s/backend-service.yaml
+          kubectl rollout status deployment/tienda-backend -n tienda --timeout=300s
+
+      - name: Desplegar Frontend
+        run: |
+          kubectl apply -f ./k8s/frontend-deployment.yaml
+          kubectl apply -f ./k8s/frontend-service.yaml
+          kubectl rollout status deployment/tienda-frontend -n tienda --timeout=300s
+
+      - name: Obtener URL del LoadBalancer
+        run: |
+          for i in $(seq 1 40); do
+            HOSTNAME=$(kubectl get svc tienda-frontend -n tienda -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -n "$HOSTNAME" ]; then
+              echo "APLICACION DISPONIBLE EN: http://$HOSTNAME"
+              exit 0
+            fi
+            echo "Esperando IP publica... ($i/40)"
+            sleep 15
+          done
+          echo "No fue posible obtener la IP publica a tiempo. Revisar manualmente con: kubectl get svc tienda-frontend -n tienda"
