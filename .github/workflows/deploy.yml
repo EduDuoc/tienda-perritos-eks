@@ -95,6 +95,13 @@ jobs:
           kubectl apply -f ./k8s/frontend-service.yaml
           kubectl rollout status deployment/tienda-frontend -n tienda --timeout=300s
 
+      - name: Forzar actualizacion de pods (rollout restart)
+        run: |
+          kubectl rollout restart deployment/tienda-frontend -n tienda
+          kubectl rollout restart deployment/tienda-backend -n tienda
+          kubectl rollout status deployment/tienda-frontend -n tienda --timeout=300s
+          kubectl rollout status deployment/tienda-backend -n tienda --timeout=300s
+
       - name: Obtener URL del LoadBalancer
         run: |
           for i in $(seq 1 40); do
